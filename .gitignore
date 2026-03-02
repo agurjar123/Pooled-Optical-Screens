@@ -1,0 +1,25 @@
+# Claude Code local settings
+.claude/
+
+# macOS
+.DS_Store
+
+# Large binary / non-code files
+readings/
+*.pptx
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+.venv
+venv/
