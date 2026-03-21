@@ -1,15 +1,16 @@
 """
 deconvolution.py
 ================
-4-color ISS barcode deconvolution for combinatorial CRISPR screens.
+ISS barcode deconvolution for combinatorial CRISPR screens.
 
-Simulates sequencing of gRNA barcodes under 4-color ISS chemistry where
-co-transduced gRNAs produce summed (non-spatially-resolvable) fluorescence signals.
-Tests whether k-plex combinations of gRNAs can be deconvolved from those signals.
+Supports 4-color and 2-color sequencing chemistry.  Simulates whether k-plex
+gRNA combinations can be deconvolved from summed fluorescence signals.
 
 Assumptions
 -----------
-- 4-color chemistry: A, C, G, T channels (one-hot encoded)
+- 4-color chemistry: A, C, G, T channels (one-hot encoded, shape (L,4))
+- 2-color chemistry (Illumina NovaSeq/NextSeq): A=[1,1], T=[1,0], C=[0,1], G=[0,0]
+  (shape (L,2))
 - Signals ADD when cells contain multiple gRNAs (equal abundance, 50:50)
 - Unordered combinations with replacement (order of gRNAs doesn't matter)
 - Noiseless baseline; dropout simulation available separately
@@ -35,6 +36,11 @@ import pandas as pd
 
 BASES = "ACGT"
 B2I: Dict[str, int] = {b: i for i, b in enumerate(BASES)}
+
+# Illumina 2-channel chemistry: A=[green,red], T=[green,_], C=[_,red], G=[_,_]
+ENCODING_2COLOR: Dict[str, List[int]] = {
+    "A": [1, 1], "C": [0, 1], "G": [0, 0], "T": [1, 0]
+}
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +107,39 @@ def onehot_4color(seq: str, L: int) -> np.ndarray:
     return x
 
 
+def encode_seq(seq: str, L: int, chemistry: str = "4color") -> np.ndarray:
+    """Encode the first L bases of seq according to chemistry.
+
+    Parameters
+    ----------
+    seq : str
+        DNA sequence (A/C/G/T, case-insensitive).
+    L : int
+        Number of positions to encode.
+    chemistry : str
+        '4color' (default) or '2color'.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (L, 4) for '4color', (L, 2) for '2color'.
+    """
+    if chemistry == "4color":
+        return onehot_4color(seq, L)
+    if chemistry == "2color":
+        x = np.zeros((L, 2), dtype=np.uint8)
+        for p, b in enumerate(seq[:L]):
+            x[p] = ENCODING_2COLOR[b.upper()]
+        return x
+    raise ValueError(f"Unknown chemistry: {chemistry!r}. Use '4color' or '2color'.")
+
+
 # ---------------------------------------------------------------------------
 # Signal computation
 # ---------------------------------------------------------------------------
 
-def pair_sum(seq1: str, seq2: str, L: int) -> np.ndarray:
-    """Summed 4-color signal for two spacers at equal abundance.
+def pair_sum(seq1: str, seq2: str, L: int, chemistry: str = "4color") -> np.ndarray:
+    """Summed signal for two spacers at equal abundance.
 
     Parameters
     ----------
@@ -114,18 +147,22 @@ def pair_sum(seq1: str, seq2: str, L: int) -> np.ndarray:
         Spacer sequences.
     L : int
         Prefix length to use.
+    chemistry : str
+        '4color' (default) or '2color'.
 
     Returns
     -------
     np.ndarray
-        Shape (L, 4), dtype int16.  Values in {0, 1, 2}.
+        Shape (L, 4) or (L, 2), dtype int16.  Values in {0, 1, 2}.
     """
-    return (onehot_4color(seq1, L).astype(np.int16)
-            + onehot_4color(seq2, L).astype(np.int16))
+    return (encode_seq(seq1, L, chemistry).astype(np.int16)
+            + encode_seq(seq2, L, chemistry).astype(np.int16))
 
 
-def k_sum_signal(spacers: List[str], combo: Tuple[int, ...], L: int) -> np.ndarray:
-    """Summed 4-color signal for a k-plex combination (indices, with replacement).
+def k_sum_signal(
+    spacers: List[str], combo: Tuple[int, ...], L: int, chemistry: str = "4color"
+) -> np.ndarray:
+    """Summed signal for a k-plex combination (indices, with replacement).
 
     Parameters
     ----------
@@ -134,20 +171,23 @@ def k_sum_signal(spacers: List[str], combo: Tuple[int, ...], L: int) -> np.ndarr
         Sorted tuple of spacer indices (may repeat).
     L : int
         Prefix length.
+    chemistry : str
+        '4color' (default) or '2color'.
 
     Returns
     -------
     np.ndarray
-        Shape (L, 4), values in {0, ..., k}.
+        Shape (L, 4) or (L, 2), values in {0, ..., k}.
     """
-    s = np.zeros((L, 4), dtype=np.int16)
+    n_ch = 4 if chemistry == "4color" else 2
+    s = np.zeros((L, n_ch), dtype=np.int16)
     for idx in combo:
-        s += onehot_4color(spacers[idx], L)
+        s += encode_seq(spacers[idx], L, chemistry)
     return s
 
 
 def generate_imaging_matrix(
-    spacers: List[str], L: int
+    spacers: List[str], L: int, chemistry: str = "4color"
 ) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
     """Pre-compute all pair-sum signals as a stacked matrix.
 
@@ -155,15 +195,17 @@ def generate_imaging_matrix(
     ----------
     spacers : List[str]
     L : int
+    chemistry : str
+        '4color' (default) or '2color'.
 
     Returns
     -------
     matrix : np.ndarray
-        Shape (n_pairs, L, 4).
+        Shape (n_pairs, L, 4) or (n_pairs, L, 2).
     pairs : list of (i, j)
     """
     pairs = all_pairs(len(spacers))
-    matrix = np.stack([pair_sum(spacers[i], spacers[j], L) for i, j in pairs])
+    matrix = np.stack([pair_sum(spacers[i], spacers[j], L, chemistry) for i, j in pairs])
     return matrix, pairs
 
 
@@ -189,7 +231,7 @@ def all_pairs(n: int) -> List[Tuple[int, int]]:
 # Collision detection (k = 2)
 # ---------------------------------------------------------------------------
 
-def collision_stats(spacers: List[str], L: int) -> Dict:
+def collision_stats(spacers: List[str], L: int, chemistry: str = "4color") -> Dict:
     """Exact collision statistics for all unordered 2-gRNA pairs.
 
     Parameters
@@ -197,6 +239,8 @@ def collision_stats(spacers: List[str], L: int) -> Dict:
     spacers : List[str]
     L : int
         Prefix length.
+    chemistry : str
+        '4color' (default) or '2color'.
 
     Returns
     -------
@@ -207,7 +251,7 @@ def collision_stats(spacers: List[str], L: int) -> Dict:
     pairs = all_pairs(len(spacers))
     mapping: Dict[bytes, List[Tuple[int, int]]] = {}
     for i, j in pairs:
-        k = signal_key(pair_sum(spacers[i], spacers[j], L))
+        k = signal_key(pair_sum(spacers[i], spacers[j], L, chemistry))
         mapping.setdefault(k, []).append((i, j))
     total = len(pairs)
     collision_groups = {k: v for k, v in mapping.items() if len(v) > 1}
@@ -229,7 +273,9 @@ def collision_stats(spacers: List[str], L: int) -> Dict:
 # Collision detection (k-plex, k ≥ 1)
 # ---------------------------------------------------------------------------
 
-def collision_stats_k(spacers: List[str], k: int, L: int) -> Dict:
+def collision_stats_k(
+    spacers: List[str], k: int, L: int, chemistry: str = "4color"
+) -> Dict:
     """Exact collision statistics for all k-plex combinations (k ≥ 1).
 
     Parameters
@@ -239,6 +285,8 @@ def collision_stats_k(spacers: List[str], k: int, L: int) -> Dict:
         Number of gRNAs per cell (combination order).
     L : int
         Prefix length.
+    chemistry : str
+        '4color' (default) or '2color'.
 
     Returns
     -------
@@ -250,7 +298,7 @@ def collision_stats_k(spacers: List[str], k: int, L: int) -> Dict:
     mapping: Dict[bytes, int] = defaultdict(int)
     total = 0
     for combo in combinations_with_replacement(range(n), k):
-        key = signal_key(k_sum_signal(spacers, combo, L))
+        key = signal_key(k_sum_signal(spacers, combo, L, chemistry))
         mapping[key] += 1
         total += 1
     ambiguous = sum(cnt for cnt in mapping.values() if cnt >= 2)
@@ -267,11 +315,12 @@ def collision_stats_k(spacers: List[str], k: int, L: int) -> Dict:
 
 
 def min_L_for_ambig(
-    spacers: List[str], k: int, Ls=range(1, 21), thresh: float = 1e-3
+    spacers: List[str], k: int, Ls=range(1, 21), thresh: float = 1e-3,
+    chemistry: str = "4color",
 ) -> Tuple[Optional[int], Optional[float]]:
     """Find minimum prefix length L where ambiguous_fraction ≤ thresh."""
     for L in Ls:
-        af = collision_stats_k(spacers, k, L)["ambiguous_fraction"]
+        af = collision_stats_k(spacers, k, L, chemistry)["ambiguous_fraction"]
         if af <= thresh:
             return L, af
     return None, None
@@ -281,7 +330,7 @@ def min_L_for_ambig(
 # Lookup table + deconvolution (k = 2)
 # ---------------------------------------------------------------------------
 
-def build_lookup_table(spacers: List[str], L: int) -> Dict:
+def build_lookup_table(spacers: List[str], L: int, chemistry: str = "4color") -> Dict:
     """Build a signal → pair lookup table for exact deconvolution.
 
     Returns a dict mapping signal_key(bytes) to:
@@ -292,7 +341,7 @@ def build_lookup_table(spacers: List[str], L: int) -> Dict:
     lookup: Dict = {}
     ambiguous: Dict = {}
     for i, j in pairs:
-        k = signal_key(pair_sum(spacers[i], spacers[j], L))
+        k = signal_key(pair_sum(spacers[i], spacers[j], L, chemistry))
         if k in lookup:
             if k not in ambiguous:
                 ambiguous[k] = [lookup[k]]
@@ -328,7 +377,7 @@ def deconvolve_signal(
     return result, not isinstance(result, list)
 
 
-def deconvolution_counts(spacers: List[str], L: int) -> Dict:
+def deconvolution_counts(spacers: List[str], L: int, chemistry: str = "4color") -> Dict:
     """Test noiseless deconvolution accuracy for all 2-gRNA pairs.
 
     Returns
@@ -338,12 +387,12 @@ def deconvolution_counts(spacers: List[str], L: int) -> Dict:
         accuracy_strict (correct/total),
         accuracy_lenient ((correct+ambiguous)/total).
     """
-    stats = collision_stats(spacers, L)
+    stats = collision_stats(spacers, L, chemistry)
     mapping = stats["mapping"]
     pairs = all_pairs(len(spacers))
     correct = ambiguous = failed = 0
     for i, j in pairs:
-        k = signal_key(pair_sum(spacers[i], spacers[j], L))
+        k = signal_key(pair_sum(spacers[i], spacers[j], L, chemistry))
         cand = mapping.get(k, [])
         if len(cand) == 0:
             failed += 1
@@ -442,6 +491,7 @@ def deconvolution_counts_dropout(
     dropout_p: float,
     n_trials: int = 200,
     seed: int = 42,
+    chemistry: str = "4color",
 ) -> Dict:
     """Monte Carlo dropout simulation for 2-gRNA pair deconvolution.
 
@@ -459,6 +509,8 @@ def deconvolution_counts_dropout(
         Number of Monte Carlo trials per pair.
     seed : int
         Random seed for reproducibility.
+    chemistry : str
+        '4color' (default) or '2color'.
 
     Returns
     -------
@@ -468,11 +520,11 @@ def deconvolution_counts_dropout(
         accuracy_strict, accuracy_lenient.
     """
     rng = np.random.default_rng(seed)
-    pair_signals, pairs = generate_imaging_matrix(spacers, L)
+    pair_signals, pairs = generate_imaging_matrix(spacers, L, chemistry)
 
     correct = ambiguous = failed = 0
     for true_i, true_j in pairs:
-        true_signal = pair_sum(spacers[true_i], spacers[true_j], L)
+        true_signal = pair_sum(spacers[true_i], spacers[true_j], L, chemistry)
         for _ in range(n_trials):
             obs, mask = simulate_dropout(true_signal, dropout_p, rng)
             candidates = deconvolve_with_dropout(obs, mask, pair_signals, pairs)
@@ -498,7 +550,7 @@ def deconvolution_counts_dropout(
 
 
 def deconvolution_counts_positional(
-    spacers: List[str], L: int, n_drop: int = 1
+    spacers: List[str], L: int, n_drop: int = 1, chemistry: str = "4color"
 ) -> Dict[Tuple[int, ...], Dict]:
     """Deterministic deconvolution for all combinations of exactly n_drop dropped positions.
 
@@ -523,7 +575,7 @@ def deconvolution_counts_positional(
         drop_positions
     }
     """
-    pair_signals, pairs = generate_imaging_matrix(spacers, L)
+    pair_signals, pairs = generate_imaging_matrix(spacers, L, chemistry)
     results: Dict[Tuple[int, ...], Dict] = {}
 
     for drop_positions in combinations(range(L), n_drop):
@@ -565,34 +617,42 @@ def hamming_distance_prefix(a: str, b: str, L: int) -> int:
     return sum(ca != cb for ca, cb in zip(a[:L], b[:L]))
 
 
-def sanity_onehot(spacers: List[str], L: int = 10, n_test: int = 5) -> None:
-    """Assert that one-hot encoding is correct for first n_test spacers."""
+def sanity_onehot(
+    spacers: List[str], L: int = 10, n_test: int = 5, chemistry: str = "4color"
+) -> None:
+    """Assert that encoding is correct for first n_test spacers."""
+    n_ch = 4 if chemistry == "4color" else 2
     for idx in range(min(n_test, len(spacers))):
-        X = onehot_4color(spacers[idx], L)
-        assert X.shape == (L, 4)
-        assert np.all(X.sum(axis=1) == 1), "each position must have exactly one 1"
-        assert set(np.unique(X)).issubset({0, 1}), "only 0/1 values"
-    print("PASS: one-hot encoding checks")
+        X = encode_seq(spacers[idx], L, chemistry)
+        assert X.shape == (L, n_ch), f"expected ({L},{n_ch}), got {X.shape}"
+        assert set(np.unique(X)).issubset({0, 1}), "only 0/1 values expected"
+        if chemistry == "4color":
+            assert np.all(X.sum(axis=1) == 1), "4-color: each position must sum to 1"
+    print(f"PASS: encoding checks ({chemistry})")
 
 
 def sanity_ksum(
-    spacers: List[str], k: int = 6, L: int = 7, n_trials: int = 50, seed: int = 0
+    spacers: List[str], k: int = 6, L: int = 7, n_trials: int = 50, seed: int = 0,
+    chemistry: str = "4color",
 ) -> None:
-    """Assert that k-sum signals have correct shape and channel sums."""
+    """Assert that k-sum signals have correct shape and value range."""
     import random
     random.seed(seed)
+    n_ch = 4 if chemistry == "4color" else 2
     n = len(spacers)
     for _ in range(n_trials):
         combo = tuple(sorted([random.randrange(n) for _ in range(k)]))
-        S = k_sum_signal(spacers, combo, L)
-        assert S.shape == (L, 4)
-        assert np.all(S.sum(axis=1) == k), "each position must sum to k"
+        S = k_sum_signal(spacers, combo, L, chemistry)
+        assert S.shape == (L, n_ch), f"expected ({L},{n_ch}), got {S.shape}"
         assert 0 <= S.min() and S.max() <= k
-    print("PASS: k-sum signal checks")
+        if chemistry == "4color":
+            assert np.all(S.sum(axis=1) == k), "4-color: each position must sum to k"
+    print(f"PASS: k-sum signal checks ({chemistry})")
 
 
 def sample_collision_audit(
-    spacers: List[str], k: int = 6, L: int = 7, n_samples: int = 20000, seed: int = 0
+    spacers: List[str], k: int = 6, L: int = 7, n_samples: int = 20000, seed: int = 0,
+    chemistry: str = "4color",
 ) -> Optional[Tuple]:
     """Random-sample collision audit for k-plex signals."""
     import random
@@ -601,7 +661,7 @@ def sample_collision_audit(
     seen: Dict = defaultdict(list)
     for _ in range(n_samples):
         combo = tuple(sorted([random.randrange(n) for _ in range(k)]))
-        sig = signal_key(k_sum_signal(spacers, combo, L))
+        sig = signal_key(k_sum_signal(spacers, combo, L, chemistry))
         seen[sig].append(combo)
 
     collisions = []
@@ -614,8 +674,8 @@ def sample_collision_audit(
     if collisions:
         _, combos = collisions[0]
         c1, c2 = combos[0], combos[1]
-        S1 = k_sum_signal(spacers, c1, L)
-        S2 = k_sum_signal(spacers, c2, L)
+        S1 = k_sum_signal(spacers, c1, L, chemistry)
+        S2 = k_sum_signal(spacers, c2, L, chemistry)
         print(f"Example collision: {c1} vs {c2}, equal? {np.array_equal(S1, S2)}")
         return c1, c2
     return None
@@ -631,12 +691,13 @@ def k1_prefix_check(spacers: List[str], L: int) -> None:
 
 
 def min_L_to_resolve(
-    spacers: List[str], combo1: tuple, combo2: tuple, L_max: int = 30
+    spacers: List[str], combo1: tuple, combo2: tuple, L_max: int = 30,
+    chemistry: str = "4color",
 ) -> Optional[int]:
     """Find minimum prefix length at which two k-plex combos produce different signals."""
     for L in range(1, L_max + 1):
-        if not np.array_equal(k_sum_signal(spacers, combo1, L),
-                              k_sum_signal(spacers, combo2, L)):
+        if not np.array_equal(k_sum_signal(spacers, combo1, L, chemistry),
+                              k_sum_signal(spacers, combo2, L, chemistry)):
             return L
     return None
 
@@ -650,15 +711,16 @@ def plot_ambiguity_vs_L(
     Ls=range(4, 21),
     mark: Tuple[int, ...] = (10, 20),
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Line plot of ambiguous_fraction vs prefix length (k=2 pairs)."""
     Ls = list(Ls)
-    amb = [collision_stats(spacers, L)["ambiguous_fraction"] for L in Ls]
+    amb = [collision_stats(spacers, L, chemistry)["ambiguous_fraction"] for L in Ls]
     plt.figure()
     plt.plot(Ls, amb, marker="o")
     plt.xlabel("Prefix length L (nt)")
     plt.ylabel("Ambiguous fraction of 2-gRNA pairs")
-    plt.title("Exact-collision ambiguity vs read length (noiseless 4-color sum)")
+    plt.title(f"Exact-collision ambiguity vs read length (noiseless {chemistry} sum)")
     for Lm in mark:
         if Lm in Ls:
             idx = Ls.index(Lm)
@@ -678,10 +740,11 @@ def plot_deconvolution_bars(
     spacers: List[str],
     Ls=(1, 2, 3, 4, 5, 8, 10, 15, 20),
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Grouped bar chart of correct / ambiguous / failed counts per prefix length."""
     cats = ["correct", "ambiguous", "failed"]
-    vals = [[deconvolution_counts(spacers, L)[c] for c in cats] for L in Ls]
+    vals = [[deconvolution_counts(spacers, L, chemistry)[c] for c in cats] for L in Ls]
     x = np.arange(len(Ls))
     w = 0.25
     plt.figure(figsize=(max(8, len(Ls) * 0.8), 4))
@@ -706,10 +769,11 @@ def plot_nearest_neighbor_risk(
     L: int = 10,
     n_show: int = 10,
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Heatmap grid of the n_show most confusable pair-sum signals (by NN distance)."""
     pairs = all_pairs(len(spacers))
-    X = np.stack([pair_sum(spacers[i], spacers[j], L).reshape(-1)
+    X = np.stack([pair_sum(spacers[i], spacers[j], L, chemistry).reshape(-1)
                   for i, j in pairs]).astype(float)
     dmin = np.full(len(pairs), np.inf)
     nn = np.full(len(pairs), -1, dtype=int)
@@ -726,13 +790,14 @@ def plot_nearest_neighbor_risk(
     fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
     axes = np.array(axes).reshape(-1)
 
+    ch_labels = list(BASES) if chemistry == "4color" else ["green", "red"]
     for k, idx in enumerate(riskiest):
         i, j = pairs[idx]
         bi, bj = pairs[nn[idx]]
-        sig = pair_sum(spacers[i], spacers[j], L)
+        sig = pair_sum(spacers[i], spacers[j], L, chemistry)
         axes[k].imshow(sig.T, aspect="auto", vmin=0, vmax=2)
-        axes[k].set_yticks([0, 1, 2, 3])
-        axes[k].set_yticklabels(list(BASES))
+        axes[k].set_yticks(range(len(ch_labels)))
+        axes[k].set_yticklabels(ch_labels)
         axes[k].set_title(f"({i},{j}) nn=({bi},{bj})\nd={dmin[idx]:.2f}", fontsize=8)
 
     for k in range(n_show, len(axes)):
@@ -753,11 +818,12 @@ def plot_nn_distance_distribution(
     L: int = 10,
     bins: int = 30,
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Histogram of nearest-neighbor distances across all pair-sum signals."""
     from scipy.spatial.distance import pdist, squareform
     pairs = all_pairs(len(spacers))
-    X = np.stack([pair_sum(spacers[i], spacers[j], L).reshape(-1)
+    X = np.stack([pair_sum(spacers[i], spacers[j], L, chemistry).reshape(-1)
                   for i, j in pairs]).astype(float)
     D = squareform(pdist(X, metric="euclidean"))
     np.fill_diagonal(D, np.inf)
@@ -785,6 +851,7 @@ def visualize_pairs_by_within_similarity(
     prefix_len: int = 10,
     n_show: int = 10,
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Heatmaps of n_show most within-similar non-self gRNA pairs (by Hamming distance)."""
     pairs_distinct = list(combinations(range(len(spacers)), 2))
@@ -799,11 +866,12 @@ def visualize_pairs_by_within_similarity(
     fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
     axes = np.array(axes).reshape(-1)
 
+    ch_labels = list(BASES) if chemistry == "4color" else ["green", "red"]
     for ax_idx, (d, i, j) in enumerate(top):
-        sig = pair_sum(spacers[i], spacers[j], prefix_len)
+        sig = pair_sum(spacers[i], spacers[j], prefix_len, chemistry)
         axes[ax_idx].imshow(sig.T, aspect="auto", vmin=0, vmax=2)
-        axes[ax_idx].set_yticks([0, 1, 2, 3])
-        axes[ax_idx].set_yticklabels(list(BASES))
+        axes[ax_idx].set_yticks(range(len(ch_labels)))
+        axes[ax_idx].set_yticklabels(ch_labels)
         axes[ax_idx].set_xticks([])
         axes[ax_idx].set_title(
             f"({i},{j}) ham={d}/{prefix_len}", fontsize=8
@@ -850,11 +918,12 @@ def plot_ambig_vs_k_many_L(
     ks=range(1, 6),
     Ls=(3, 4, 5, 6, 10, 20),
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Ambiguous fraction vs k, one line per L value."""
     plt.figure()
     for L in Ls:
-        amb = [collision_stats_k(spacers, k, L)["ambiguous_fraction"] for k in ks]
+        amb = [collision_stats_k(spacers, k, L, chemistry)["ambiguous_fraction"] for k in ks]
         plt.plot(list(ks), amb, marker="o", label=f"L={L}")
     plt.xticks(list(ks))
     plt.xlabel("k (gRNAs per cell)")
@@ -876,11 +945,12 @@ def plot_ambig_vs_L_many_k(
     Ls=(3, 4, 5, 6, 10, 20),
     ks=range(1, 6),
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Ambiguous fraction vs L, one line per k value."""
     plt.figure()
     for k in ks:
-        amb = [collision_stats_k(spacers, k, L)["ambiguous_fraction"] for L in Ls]
+        amb = [collision_stats_k(spacers, k, L, chemistry)["ambiguous_fraction"] for L in Ls]
         plt.plot(list(Ls), amb, marker="o", label=f"k={k}")
     plt.xticks(list(Ls))
     plt.xlabel("L (barcode length, nt)")
@@ -908,6 +978,7 @@ def plot_dropout_ambiguity_vs_L(
     n_trials: int = 200,
     seed: int = 42,
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Ambiguous fraction vs L for multiple dropout rates (Monte Carlo).
 
@@ -917,7 +988,7 @@ def plot_dropout_ambiguity_vs_L(
     for p in dropout_ps:
         ambig = []
         for L in Ls:
-            res = deconvolution_counts_dropout(spacers, L, p, n_trials, seed)
+            res = deconvolution_counts_dropout(spacers, L, p, n_trials, seed, chemistry)
             total = res["total"]
             ambig.append(res["ambiguous"] / total)
         plt.plot(Ls, ambig, marker="o", label=f"p={p:.2f}")
@@ -977,11 +1048,12 @@ def plot_dropout_bars(
     n_trials: int = 200,
     seed: int = 42,
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Grouped bar chart of correct/ambiguous/failed at fixed L, varying dropout."""
     cats = ["correct", "ambiguous", "failed"]
     vals = [
-        [deconvolution_counts_dropout(spacers, L, p, n_trials, seed)[c] for c in cats]
+        [deconvolution_counts_dropout(spacers, L, p, n_trials, seed, chemistry)[c] for c in cats]
         for p in dropout_ps
     ]
     x = np.arange(len(dropout_ps))
@@ -1051,6 +1123,7 @@ def plot_n_drop_vs_accuracy(
     n_drops: List[int],
     metric: str = "accuracy_strict",
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Bar chart of mean ± std accuracy vs number of dropped positions.
 
@@ -1063,11 +1136,13 @@ def plot_n_drop_vs_accuracy(
     n_drops : List[int]
         e.g. [1, 2, 3] for L=10, [1, 2, 3, 4, 5] for L=20.
     metric : str
+    chemistry : str
+        '4color' (default) or '2color'.
     """
     means = []
     stds = []
     for n_drop in n_drops:
-        res = deconvolution_counts_positional(spacers, L, n_drop)
+        res = deconvolution_counts_positional(spacers, L, n_drop, chemistry)
         accs = np.array([v[metric] for v in res.values()])
         means.append(accs.mean())
         stds.append(accs.std())
@@ -1093,6 +1168,7 @@ def plot_positional_accuracy_heatmap(
     Ls: List[int],
     metric: str = "accuracy_strict",
     output_path: Optional[str] = None,
+    chemistry: str = "4color",
 ) -> None:
     """Heatmap of single-position dropout accuracy: y=L, x=dropped position.
 
@@ -1103,7 +1179,7 @@ def plot_positional_accuracy_heatmap(
     data = np.full((len(Ls), max_L), np.nan)
 
     for li, L in enumerate(Ls):
-        res = deconvolution_counts_positional(spacers, L, n_drop=1)
+        res = deconvolution_counts_positional(spacers, L, n_drop=1, chemistry=chemistry)
         for (pos,), v in res.items():
             data[li, pos] = v[metric]
 
